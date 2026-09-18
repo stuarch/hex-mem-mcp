@@ -5,7 +5,8 @@
 //! - `HEX_MEM_EMBEDDING_BASE_URL`: OpenAI-compatible API base URL
 //!   (default http://127.0.0.1:51480/v1)
 //! - `HEX_MEM_EMBEDDING_MODEL`: embedding model name (required)
-//! - `HEX_MEM_EMBEDDING_API_KEY`: API key, if the endpoint needs one (default "dummy")
+//! - `HEX_MEM_EMBEDDING_API_KEY`: API key, sent as a bearer token only when
+//!   non-empty (default empty, for endpoints that need no auth)
 
 mod embed;
 mod helix;
@@ -35,7 +36,7 @@ async fn main() -> Result<()> {
     let embed_base = env_or("HEX_MEM_EMBEDDING_BASE_URL", "http://127.0.0.1:51480/v1");
     let embed_model = std::env::var("HEX_MEM_EMBEDDING_MODEL")
         .context("HEX_MEM_EMBEDDING_MODEL must be set to the embedding model name")?;
-    let embed_key = env_or("HEX_MEM_EMBEDDING_API_KEY", "dummy");
+    let embed_key = env_or("HEX_MEM_EMBEDDING_API_KEY", "");
 
     let helix = HelixClient::new(&helix_url)?;
     helix.health().await.with_context(|| {
@@ -72,7 +73,8 @@ async fn main() -> Result<()> {
     // planner sees it.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
-        let root = steps::vector_search("Memory", "embedding", &probe_vec, 1, None);
+        let root =
+            steps::vector_search("Memory", "embedding", &probe_vec, 1, "probe", None);
         match helix.query("probe", "read", root).await {
             Ok(_) => break,
             Err(e) if e.to_string().contains("index_not_found") => {

@@ -131,35 +131,40 @@ pub mod steps {
         json!({"add_n": {"label": label, "properties": props}})
     }
 
+    /// Scoped vector search: results always belong to `agent_id`, with an
+    /// optional extra restriction to one namespace within that agent.
     pub fn vector_search(
         label: &str,
         property: &str,
         vector: &[f32],
         k: u32,
+        agent_id: &str,
         namespace: Option<&str>,
     ) -> Value {
-        match namespace {
-            Some(ns) => json!({
-                "vector_search_nodes_within": {
-                    "input": {"nodes_where": {"predicate": {"eq": {
-                        "left": {"property": "namespace"},
-                        "right": {"constant": {"string": ns}},
-                    }}}},
-                    "label": label,
-                    "property": property,
-                    "query_vector": prop_f32_array(vector),
-                    "k": {"literal": k},
-                }
-            }),
-            None => json!({
-                "vector_search_nodes": {
-                    "label": label,
-                    "property": property,
-                    "query_vector": prop_f32_array(vector),
-                    "k": {"literal": k},
-                }
-            }),
+        let mut predicates = vec![json!({"eq": {
+            "left": {"property": "agent_id"},
+            "right": {"constant": {"string": agent_id}},
+        }})];
+        if let Some(ns) = namespace {
+            predicates.push(json!({"eq": {
+                "left": {"property": "namespace"},
+                "right": {"constant": {"string": ns}},
+            }}));
         }
+        let predicate = if predicates.len() == 1 {
+            predicates.pop().unwrap()
+        } else {
+            json!({"and": {"predicates": predicates}})
+        };
+        json!({
+            "vector_search_nodes_within": {
+                "input": {"nodes_where": {"predicate": predicate}},
+                "label": label,
+                "property": property,
+                "query_vector": prop_f32_array(vector),
+                "k": {"literal": k},
+            }
+        })
     }
 
     pub fn value_map(input: Value, properties: &[&str]) -> Value {
@@ -170,23 +175,93 @@ pub mod steps {
         json!({"drop": {"input": {"nodes": {"reference": {"ids": [id]}}}}})
     }
 
-    pub fn count(label: &str, namespace: Option<&str>) -> Value {
-        let predicate = match namespace {
-            Some(ns) => json!({"and": {"predicates": [
-                {"eq": {
-                    "left": {"property": "$label"},
-                    "right": {"constant": {"string": label}},
-                }},
-                {"eq": {
-                    "left": {"property": "namespace"},
-                    "right": {"constant": {"string": ns}},
-                }},
-            ]}}),
-            None => json!({"eq": {
+    pub fn node_props(id: u64, properties: &[&str]) -> Value {
+        json!({"value_map": {
+            "input": {"nodes": {"reference": {"ids": [id]}}},
+            "properties": properties,
+        }})
+    }
+
+    pub fn count(label: &str, agent_id: &str, namespace: Option<&str>) -> Value {
+        let mut predicates = vec![
+            json!({"eq": {
                 "left": {"property": "$label"},
                 "right": {"constant": {"string": label}},
             }}),
-        };
+            json!({"eq": {
+                "left": {"property": "agent_id"},
+                "right": {"constant": {"string": agent_id}},
+            }}),
+        ];
+        if let Some(ns) = namespace {
+            predicates.push(json!({"eq": {
+                "left": {"property": "namespace"},
+                "right": {"constant": {"string": ns}},
+            }}));
+        }
+        let predicate = json!({"and": {"predicates": predicates}});
         json!({"count": {"input": {"nodes_where": {"predicate": predicate}}}})
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::steps;
+    use serde_json::json;
+
+    #[test]
+    fn vector_search_always_scopes_to_agent() {
+        let root = steps::vector_search("Memory", "embedding", &[0.1, 0.2], 5, "agent-a", None);
+        let scoped = &root["vector_search_nodes_within"];
+        assert!(scoped.is_object(), "must use scoped search: {root}");
+        assert_eq!(
+            scoped["input"]["nodes_where"]["predicate"],
+            json!({"eq": {
+                "left": {"property": "agent_id"},
+                "right": {"constant": {"string": "agent-a"}},
+            }}),
+        );
+    }
+
+    #[test]
+    fn vector_search_ands_namespace_within_agent() {
+        let root = steps::vector_search(
+            "Memory",
+            "embedding",
+            &[0.1, 0.2],
+            5,
+            "agent-a",
+            Some("proj"),
+        );
+        let predicate = &root["vector_search_nodes_within"]["input"]["nodes_where"]["predicate"];
+        let predicates = predicate["and"]["predicates"]
+            .as_array()
+            .expect("namespace filter must AND with the agent filter");
+        assert_eq!(predicates.len(), 2);
+        let const_str =
+            |p: &serde_json::Value| p["eq"]["right"]["constant"]["string"].clone();
+        assert!(predicates.iter().any(|p| const_str(p) == json!("agent-a")));
+        assert!(predicates.iter().any(|p| const_str(p) == json!("proj")));
+    }
+
+    #[test]
+    fn count_scopes_to_agent() {
+        let root = steps::count("Memory", "agent-a", Some("proj"));
+        let predicates = root["count"]["input"]["nodes_where"]["predicate"]["and"]["predicates"]
+            .as_array()
+            .expect("count must filter by label, agent and namespace");
+        let flat: Vec<String> = predicates.iter().map(|p| p.to_string()).collect();
+        assert!(flat.iter().any(|p| p.contains("agent-a")), "{flat:?}");
+        assert!(flat.iter().any(|p| p.contains("\"proj\"")), "{flat:?}");
+    }
+
+    #[test]
+    fn node_props_targets_single_id() {
+        let root = steps::node_props(42, &["agent_id"]);
+        assert_eq!(
+            root["value_map"]["input"]["nodes"]["reference"]["ids"],
+            json!([42]),
+        );
+        assert_eq!(root["value_map"]["properties"], json!(["agent_id"]));
     }
 }

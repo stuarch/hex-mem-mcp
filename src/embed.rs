@@ -25,14 +25,28 @@ impl Embedder {
         })
     }
 
-    pub async fn embed(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+    /// Build the embeddings POST request. An empty API key (the default)
+    /// sends no Authorization header, for endpoints that need no auth.
+    fn build_request(&self, inputs: &[String]) -> Result<reqwest::Request> {
         let url = format!("{}/embeddings", self.base_url);
-        let resp = self
+        let builder = self
             .http
             .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(&json!({"model": self.model, "input": inputs}))
-            .send()
+            .json(&json!({"model": self.model, "input": inputs}));
+        let builder = if self.api_key.is_empty() {
+            builder
+        } else {
+            builder.bearer_auth(&self.api_key)
+        };
+        builder.build().context("build embedding request")
+    }
+
+    pub async fn embed(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+        let url = format!("{}/embeddings", self.base_url);
+        let req = self.build_request(inputs)?;
+        let resp = self
+            .http
+            .execute(req)
             .await
             .with_context(|| format!("post {url}"))?;
         let status = resp.status();
@@ -52,5 +66,38 @@ impl Embedder {
             out.push(vec);
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Embedder;
+
+    fn embedder_with_key(key: &str) -> Embedder {
+        Embedder::new("http://127.0.0.1:9/v1", "model", key).unwrap()
+    }
+
+    #[test]
+    fn empty_key_sends_no_authorization_header() {
+        let req = embedder_with_key("")
+            .build_request(&["hi".to_string()])
+            .unwrap();
+        assert_eq!(req.url().as_str(), "http://127.0.0.1:9/v1/embeddings");
+        assert!(
+            !req.headers().contains_key(reqwest::header::AUTHORIZATION),
+            "empty key must omit the header, got: {:?}",
+            req.headers()
+        );
+    }
+
+    #[test]
+    fn nonempty_key_sends_bearer_header() {
+        let req = embedder_with_key("s3cret")
+            .build_request(&["hi".to_string()])
+            .unwrap();
+        let auth = req.headers()[reqwest::header::AUTHORIZATION]
+            .to_str()
+            .unwrap();
+        assert_eq!(auth, "Bearer s3cret");
     }
 }

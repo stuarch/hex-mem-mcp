@@ -29,11 +29,31 @@ fn internal<E: std::fmt::Display>(err: E) -> McpError {
     McpError::internal_error(err.to_string(), None)
 }
 
+/// Agent identity is cooperative (any local caller can claim any id) but
+/// structurally enforced: every query filters on it, so one agent can never
+/// see another agent's memories through these tools.
+fn require_agent_id(id: &str) -> Result<String, McpError> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err(McpError::invalid_params("agent_id must not be empty", None));
+    }
+    Ok(id.to_string())
+}
+
+/// Read a string property whether Helix returns it decoded or still wrapped
+/// in its `{"value": {"string": ...}}` encoding.
+fn prop_as_str(v: &serde_json::Value) -> Option<&str> {
+    v.as_str()
+        .or_else(|| v.get("value")?.get("string")?.as_str())
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct StoreArgs {
+    /// Identity of the calling agent. The memory is private to this id.
+    pub agent_id: String,
     /// The memory text to store. Write it as a self-contained fact or note.
     pub text: String,
-    /// Namespace isolating memories per agent or project. Defaults to "default".
+    /// Namespace isolating memories per project within this agent. Defaults to "default".
     pub namespace: Option<String>,
     /// Importance from 0.0 to 1.0. Defaults to 0.5.
     pub importance: Option<f32>,
@@ -43,6 +63,8 @@ pub struct StoreArgs {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RecallArgs {
+    /// Identity of the calling agent. Only this agent's memories are searched.
+    pub agent_id: String,
     /// Natural-language query describing what to recall.
     pub query: String,
     /// Restrict recall to one namespace. Omit to search all namespaces.
@@ -53,12 +75,16 @@ pub struct RecallArgs {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ForgetArgs {
+    /// Identity of the calling agent. Must own the memory to delete it.
+    pub agent_id: String,
     /// The numeric id of the memory to delete (see memory_recall results).
     pub id: u64,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct StatsArgs {
+    /// Identity of the calling agent. Only this agent's memories are counted.
+    pub agent_id: String,
     /// Count memories in one namespace only. Omit to count all namespaces.
     pub namespace: Option<String>,
 }
@@ -83,6 +109,7 @@ impl Memory {
         if args.text.trim().is_empty() {
             return Err(McpError::invalid_params("text must not be empty", None));
         }
+        let agent = require_agent_id(&args.agent_id)?;
         let namespace = args
             .namespace
             .unwrap_or_else(|| DEFAULT_NAMESPACE.to_string());
@@ -101,6 +128,7 @@ impl Memory {
             LABEL,
             vec![
                 ("text".to_string(), prop_string(&args.text)),
+                ("agent_id".to_string(), prop_string(&agent)),
                 ("namespace".to_string(), prop_string(&namespace)),
                 ("importance".to_string(), prop_f32(importance)),
                 ("created_at".to_string(), prop_i64(now_epoch())),
@@ -123,6 +151,7 @@ impl Memory {
             Some(id) => text_result(
                 serde_json::json!({
                     "id": id,
+                    "agent_id": agent,
                     "namespace": namespace,
                     "chars": args.text.chars().count(),
                 })
@@ -142,6 +171,7 @@ impl Memory {
         if args.query.trim().is_empty() {
             return Err(McpError::invalid_params("query must not be empty", None));
         }
+        let agent = require_agent_id(&args.agent_id)?;
         let top_k = args.top_k.unwrap_or(5).clamp(1, 50);
         let vecs = self
             .embedder
@@ -157,11 +187,12 @@ impl Memory {
             EMBEDDING_PROP,
             &embedding,
             top_k,
+            &agent,
             args.namespace.as_deref(),
         );
         let root = steps::value_map(
             search,
-            &["$id", "text", "namespace", "importance", "created_at"],
+            &["$id", "agent_id", "text", "namespace", "importance", "created_at"],
         );
         let reply = self
             .helix
@@ -178,6 +209,7 @@ impl Memory {
             .map(|h| {
                 serde_json::json!({
                     "id": h.get("$id"),
+                    "agent_id": h.get("agent_id"),
                     "text": h.get("text"),
                     "namespace": h.get("namespace"),
                     "importance": h.get("importance"),
@@ -188,11 +220,31 @@ impl Memory {
         text_result(serde_json::json!({"count": results.len(), "results": results}).to_string())
     }
 
-    #[tool(description = "Delete one memory by its numeric id.")]
+    #[tool(description = "Delete one memory by its numeric id. Only the owning agent may delete it.")]
     async fn memory_forget(
         &self,
         Parameters(args): Parameters<ForgetArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let agent = require_agent_id(&args.agent_id)?;
+        let root = steps::node_props(args.id, &["agent_id"]);
+        let reply = self
+            .helix
+            .query("owner", "read", root)
+            .await
+            .map_err(internal)?;
+        let owner = reply
+            .get("owner")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|n| n.get("agent_id"))
+            .and_then(prop_as_str);
+        // Deliberately ambiguous: a wrong id and another agent's id look the same.
+        if owner != Some(agent.as_str()) {
+            return Err(McpError::invalid_params(
+                format!("memory {} not found or belongs to another agent", args.id),
+                None,
+            ));
+        }
         let root = steps::drop_by_id(args.id);
         self.helix
             .query("gone", "write", root)
@@ -201,19 +253,23 @@ impl Memory {
         text_result(serde_json::json!({"forgot": args.id}).to_string())
     }
 
-    #[tool(description = "Count stored memories, optionally restricted to one namespace.")]
+    #[tool(description = "Count this agent's stored memories, optionally restricted to one namespace.")]
     async fn memory_stats(
         &self,
         Parameters(args): Parameters<StatsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let root = steps::count(LABEL, args.namespace.as_deref());
+        let agent = require_agent_id(&args.agent_id)?;
+        let root = steps::count(LABEL, &agent, args.namespace.as_deref());
         let reply = self
             .helix
             .query("total", "read", root)
             .await
             .map_err(internal)?;
         let count = reply.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
-        text_result(serde_json::json!({"namespace": args.namespace, "count": count}).to_string())
+        text_result(
+            serde_json::json!({"agent_id": agent, "namespace": args.namespace, "count": count})
+                .to_string(),
+        )
     }
 }
 
@@ -223,11 +279,35 @@ impl ServerHandler for Memory {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
             .with_instructions(
-                "Agent long-term memory backed by HelixDB. Tools: memory_store saves one \
-             self-contained fact; memory_recall finds similar memories (optionally within \
-             one namespace); memory_forget deletes by id; memory_stats counts stored \
-             memories. Use namespaces to separate agents or projects."
+                "Agent long-term memory backed by HelixDB. Every tool requires agent_id: \
+             memories are private to that id, and each tool only ever sees the calling \
+             agent's own memories. Tools: memory_store saves one self-contained fact \
+             (optionally namespaced per project); memory_recall finds similar memories; \
+             memory_forget deletes by id; memory_stats counts stored memories."
                     .to_string(),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{prop_as_str, require_agent_id};
+    use serde_json::json;
+
+    #[test]
+    fn agent_id_must_be_nonempty() {
+        assert!(require_agent_id("").is_err());
+        assert!(require_agent_id("   ").is_err());
+        assert_eq!(require_agent_id("  agent-a ").unwrap(), "agent-a");
+    }
+
+    #[test]
+    fn prop_as_str_reads_both_encodings() {
+        assert_eq!(prop_as_str(&json!("agent-a")), Some("agent-a"));
+        assert_eq!(
+            prop_as_str(&json!({"value": {"string": "agent-a"}})),
+            Some("agent-a")
+        );
+        assert_eq!(prop_as_str(&json!(null)), None);
     }
 }
