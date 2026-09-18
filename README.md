@@ -1,4 +1,4 @@
-# hex-mem-cp
+# hex-mem-mcp
 
 Agent long-term memory MCP server backed by [HelixDB](https://github.com/HelixDB/helix-db).
 It exposes four typed tools over stdio so any MCP-capable coding agent
@@ -57,7 +57,7 @@ therefore the vector dimension — must stay fixed afterwards.
 
 ```sh
 cargo build --release
-HEX_MEM_EMBEDDING_MODEL=Qwen3-Embedding-0.6B-Q8_0 ./target/release/hex-mem-cp
+HEX_MEM_EMBEDDING_MODEL=Qwen3-Embedding-0.6B-Q8_0 ./target/release/hex-mem-mcp
 ```
 
 Requires Rust 1.88+ and a C compiler + cmake (for the rustls TLS backend).
@@ -69,7 +69,7 @@ extensions:
   hexmem:
     enabled: true
     type: stdio
-    cmd: /path/to/hex-mem-cp
+    cmd: /path/to/hex-mem-mcp
     args: []
     timeout: 300
     description: Agent long-term memory (HelixDB)

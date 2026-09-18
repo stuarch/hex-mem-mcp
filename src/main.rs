@@ -1,4 +1,4 @@
-//! hex-mem-cp: agent long-term memory MCP server backed by HelixDB.
+//! hex-mem-mcp: agent long-term memory MCP server backed by HelixDB.
 //!
 //! Configuration (environment variables):
 //! - `HEX_MEM_HELIX_URL`: HelixDB server base URL (default http://127.0.0.1:6969)

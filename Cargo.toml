@@ -1,13 +1,13 @@
 [package]
-name = "hex-mem-cp"
+name = "hex-mem-mcp"
 version = "0.1.0"
 edition = "2021"
 description = "Agent long-term memory MCP server backed by HelixDB"
 license = "MIT"
-repository = "https://github.com/stuarch/hex-mem-cp"
+repository = "https://github.com/stuarch/hex-mem-mcp"
 
 [[bin]]
-name = "hex-mem-cp"
+name = "hex-mem-mcp"
 path = "src/main.rs"
 
 [dependencies]
